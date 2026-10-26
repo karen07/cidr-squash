@@ -1,14 +1,13 @@
 # CIDR squash
 
-CIDR squash is a small IPv4 CIDR optimizer that converts an input list into a compact set of output networks.
-
-With the default settings the result is exact: it covers the same IPv4 address set while merging adjacent ranges wherever possible. An optional over-coverage budget allows the optimizer to include a small number of extra addresses in exchange for a substantially shorter CIDR list.
-
-The program is written in C, has no external runtime library dependencies, reads from a file or stdin, writes the optimized list to stdout, and keeps statistics on stderr so it can be used naturally in shell pipelines.
+CIDR squash minimizes lists of IPv4 networks. By default, it preserves the exact address
+set; an optional over-coverage budget can reduce the number of output CIDRs further.
 
 ## Описание
 
-CIDR squash - небольшая утилита для оптимизации списков IPv4 CIDR, которая преобразует входной набор сетей в более компактный набор.
+CIDR squash сокращает списки IPv4-сетей. По умолчанию программа сохраняет точно то же
+множество адресов; необязательный лимит дополнительного покрытия позволяет ещё сильнее
+уменьшить число выходных CIDR.
 
 С настройками по умолчанию результат точный: он покрывает тот же набор IPv4 адресов и по возможности объединяет соседние диапазоны. Необязательный лимит дополнительного покрытия позволяет включить небольшое число лишних адресов в обмен на заметное сокращение количества CIDR.
 
