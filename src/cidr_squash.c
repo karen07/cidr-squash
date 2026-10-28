@@ -1,27 +1,27 @@
 /*
- * cidrsquash.c - IPv4 CIDR optimizer with bounded over-coverage.
+ * cidr_squash.c - IPv4 CIDR and range optimizer with bounded over-coverage.
  *
- * Input:  IPv4 addresses or CIDRs, one per line (stdin or file).
- * Output: sorted IPv4 CIDRs on stdout.
+ * Input:  IPv4 addresses, CIDRs, or ranges (stdin or file).
+ * Output: sorted IPv4 CIDRs or address ranges on stdout.
  *
- * The program first computes the exact union and emits its minimal CIDR cover.
- * Then, with -p PERCENT, it greedily replaces groups of CIDRs by a common
- * supernet while keeping the total number of additionally covered IPv4
- * addresses <= PERCENT of the exact covered address count.
+ * The program first computes the exact union of the input addresses.
+ * With -p PERCENT, CIDR mode greedily combines subnets, while range mode
+ * fills the smallest gaps first. Both preserve the original addresses and
+ * bound the number of additional covered addresses.
  *
  * No external libraries are required; libc only.
  *
  * Example:
- *   ./cidrsquash -p 0.01 direct.txt > direct.optimized.txt
+ *   ./cidr-squash -r -p 0.01 direct.txt > ranges.txt
  *
- * Build:
- *   cc -O2 -std=c99 -Wall -Wextra -Wpedantic -o cidrsquash cidrsquash.c
+ * Build: use cmake --preset release && cmake --build --preset release.
  */
 
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +33,11 @@ typedef struct {
     uint32_t lo;
     uint32_t hi;
 } Interval;
+
+typedef struct {
+    size_t index;
+    uint64_t size;
+} Gap;
 
 typedef struct {
     Interval *v;
@@ -151,44 +156,52 @@ static int parse_line(char *line, uint32_t *lo, uint32_t *hi)
     char *p = line;
     const char *end;
     uint32_t ip;
+    uint32_t last;
     unsigned prefix = 32;
     uint32_t mask;
 
     while (isspace((unsigned char)*p))
         p++;
-    if (*p == '\0' || *p == '\n' || *p == '#')
+    if (*p == '\0' || *p == '#')
         return 0;
 
     if (!parse_ipv4(p, &end, &ip))
         return -1;
     p = (char *)end;
+    while (isspace((unsigned char)*p))
+        p++;
 
-    if (*p == '/') {
-        char *q;
-        unsigned long x;
-
-        errno = 0;
-        x = strtoul(p + 1, &q, 10);
-        if (errno || q == p + 1 || x > 32)
+    if (*p == '-') {
+        p++;
+        while (isspace((unsigned char)*p))
+            p++;
+        if (!parse_ipv4(p, &end, &last) || ip > last)
             return -1;
-        prefix = (unsigned)x;
-        p = q;
+        *lo = ip;
+        *hi = last;
+        p = (char *)end;
+    } else {
+        if (*p == '/') {
+            char *q;
+            unsigned long x;
+
+            errno = 0;
+            x = strtoul(p + 1, &q, 10);
+            if (errno || q == p + 1 || x > 32)
+                return -1;
+            prefix = (unsigned)x;
+            p = q;
+        }
+
+        mask = prefix == 0 ? 0 : UINT32_MAX << (32 - prefix);
+        *lo = ip & mask;
+        *hi = *lo | ~mask;
     }
 
     while (isspace((unsigned char)*p))
         p++;
-    if (*p != '\0' && *p != '\n' && *p != '#')
+    if (*p != '\0' && *p != '#')
         return -1;
-
-    if (prefix == 0) {
-        *lo = 0;
-        *hi = UINT32_MAX;
-        return 1;
-    }
-
-    mask = UINT32_MAX << (32 - prefix);
-    *lo = ip & mask;
-    *hi = *lo | ~mask;
     return 1;
 }
 
@@ -538,19 +551,91 @@ static void output_trie(const NodeVec *t, uint32_t idx, uint32_t base)
     }
 }
 
+static int gap_cmp(const void *ap, const void *bp)
+{
+    const Gap *a = ap;
+    const Gap *b = bp;
+
+    if (a->size < b->size)
+        return -1;
+    if (a->size > b->size)
+        return 1;
+    if (a->index < b->index)
+        return -1;
+    if (a->index > b->index)
+        return 1;
+    return 0;
+}
+
+static void print_range(uint32_t lo, uint32_t hi)
+{
+    print_ipv4(lo);
+    putchar('-');
+    print_ipv4(hi);
+    putchar('\n');
+}
+
+/* Every closed gap saves exactly one output range. Take the cheapest gaps first. */
+static size_t output_ranges(const IntervalVec *iv, uint64_t budget, uint64_t *used)
+{
+    size_t count = iv->n;
+    size_t n = iv->n;
+    Gap *gaps = NULL;
+    uint8_t *joined = NULL;
+    uint32_t lo = iv->v[0].lo;
+    uint32_t hi = iv->v[0].hi;
+
+    *used = 0;
+    if (n > 1) {
+        gaps = xrealloc(NULL, (n - 1) * sizeof(*gaps));
+        joined = xrealloc(NULL, n - 1);
+        memset(joined, 0, n - 1);
+
+        for (size_t i = 1; i < n; i++) {
+            gaps[i - 1].index = i - 1;
+            gaps[i - 1].size = (uint64_t)iv->v[i].lo - iv->v[i - 1].hi - 1;
+        }
+        qsort(gaps, n - 1, sizeof(*gaps), gap_cmp);
+
+        for (size_t i = 0; i < n - 1; i++) {
+            if (gaps[i].size > budget - *used)
+                break;
+            joined[gaps[i].index] = 1;
+            *used += gaps[i].size;
+            count--;
+        }
+    }
+
+    for (size_t i = 1; i < n; i++) {
+        if (joined[i - 1]) {
+            hi = iv->v[i].hi;
+        } else {
+            print_range(lo, hi);
+            lo = iv->v[i].lo;
+            hi = iv->v[i].hi;
+        }
+    }
+    print_range(lo, hi);
+
+    free(joined);
+    free(gaps);
+    return count;
+}
+
 static void usage(FILE *f, const char *argv0)
 {
     fprintf(f,
-            "Usage: %s [-p PERCENT] [-q] [FILE|-]\n"
+            "Usage: %s [-r] [-p PERCENT] [-q] [FILE|-]\n"
             "\n"
-            "IPv4-only CIDR squasher with bounded over-coverage.\n"
-            "Input lines: A.B.C.D or A.B.C.D/PREFIX.\n"
-            "Output: sorted CIDRs on stdout.\n"
+            "IPv4 optimizer with bounded over-coverage.\n"
+            "Input: IPv4 addresses, CIDRs, or A.B.C.D-A.B.C.D ranges.\n"
+            "Default output: minimal exact CIDRs or approximate CIDRs.\n"
             "\n"
-            "  -p PERCENT  max additional coverage as %% of exact coverage\n"
-            "              (default: 0; example: 0.01 means 0.01%%)\n"
-            "  -q          suppress statistics on stderr\n"
-            "  -h          show this help\n",
+            "  -r, --ranges  output sorted start-end ranges instead of CIDRs\n"
+            "  -p PERCENT   max additional coverage as %% of exact coverage\n"
+            "               (default: 0; example: 0.01 means 0.01%%)\n"
+            "  -q           suppress statistics on stderr\n"
+            "  -h           show this help\n",
             argv0);
 }
 
@@ -565,6 +650,9 @@ int main(int argc, char **argv)
     unsigned long line_no = 0;
     uint64_t input_entries = 0;
     uint64_t exact_cidrs = 0;
+    uint64_t exact_covered = 0;
+    size_t range_count = 0;
+    int ranges = 0;
     long double percent = 0.0L;
     uint64_t budget, used;
     int quiet = 0;
@@ -577,8 +665,10 @@ int main(int argc, char **argv)
                 die("-p requires a value");
             errno = 0;
             percent = strtold(argv[i], &end);
-            if (errno || *end != '\0' || percent < 0.0L)
+            if (errno || *end != '\0' || !isfinite(percent) || percent < 0.0L)
                 die("invalid -p percentage");
+        } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--ranges") == 0) {
+            ranges = 1;
         } else if (strcmp(argv[i], "-q") == 0) {
             quiet = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -644,6 +734,30 @@ int main(int argc, char **argv)
 
     iv.n = merge_intervals(iv.v, iv.n);
 
+    for (size_t k = 0; k < iv.n; k++)
+        exact_covered += (uint64_t)iv.v[k].hi - iv.v[k].lo + 1;
+
+    {
+        uint64_t max_extra = (uint64_t)UINT32_MAX + 1 - exact_covered;
+        long double requested = (long double)exact_covered * percent / 100.0L;
+        budget = requested >= (long double)max_extra ? max_extra : (uint64_t)requested;
+    }
+    if (ranges) {
+        range_count = output_ranges(&iv, budget, &used);
+        if (!quiet) {
+            long double actual = 100.0L * (long double)used / exact_covered;
+            fprintf(stderr, "input entries:      %" PRIu64 "\n", input_entries);
+            fprintf(stderr, "exact ranges:       %zu\n", iv.n);
+            fprintf(stderr, "output ranges:      %zu\n", range_count);
+            fprintf(stderr, "exact IPv4 covered: %" PRIu64 "\n", exact_covered);
+            fprintf(stderr, "extra IPv4 covered: %" PRIu64 "\n", used);
+            fprintf(stderr, "over-coverage:      %.8Lf%%\n", actual);
+            fprintf(stderr, "budget:             %" PRIu64 " IPv4 (%.8Lf%%)\n", budget, percent);
+        }
+        free(iv.v);
+        return 0;
+    }
+
     node_new(&tree, NONE, 0); /* root */
 
     for (size_t k = 0; k < iv.n; k++)
@@ -653,8 +767,6 @@ int main(int argc, char **argv)
 
     if (tree.v[0].covered == 0)
         die("internal error: empty trie");
-
-    budget = (uint64_t)((long double)tree.v[0].covered * percent / 100.0L);
 
     for (uint32_t idx = 0; idx < tree.n; idx++)
         push_if_candidate(&tree, &heap, idx);

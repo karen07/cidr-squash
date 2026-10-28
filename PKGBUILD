@@ -1,13 +1,13 @@
 # Build cidr-squash from the current Git working tree.
 # Set BUILDDIR outside the repository's src/ directory.
 pkgname=cidr-squash
-pkgver=0.1.0
-pkgrel=3
-pkgdesc='IPv4 CIDR optimizer with optional bounded over-coverage'
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='IPv4 CIDR and range optimizer with bounded over-coverage'
 arch=('x86_64')
 license=('AGPL-3.0-only')
 depends=('glibc')
-makedepends=('cmake')
+makedepends=('cmake' 'python')
 source=()
 
 prepare() {
@@ -22,6 +22,7 @@ prepare() {
         "$startdir/src" \
         "$startdir/LICENSE" \
         "$startdir/README.md" \
+        "$startdir/tests" \
         "$srcdir/cidr-squash/"
     if [[ -f $startdir/.clang-format ]]; then
         cp -a "$startdir/.clang-format" "$srcdir/cidr-squash/"
@@ -35,12 +36,8 @@ build() {
 }
 
 check() {
-    local actual
-    actual="$(
-        printf '%s\n' '192.168.0.0/25' '192.168.0.128/25' |
-            "$srcdir/cidr-squash/build/release/cidr-squash" -q
-    )"
-    [[ $actual == '192.168.0.0/24' ]]
+    cd "$srcdir/cidr-squash" || return 1
+    python3 -m unittest discover -s tests -v
 }
 
 package() {
